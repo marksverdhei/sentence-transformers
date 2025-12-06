@@ -75,6 +75,13 @@ class WordPooling(nn.Module):
     def get_config_dict(self) -> dict:
         return {"word_embedding_dimension": self.word_embedding_dimension}
 
+    def save(self, output_path: str, safe_serialization: bool = True) -> None:
+        import json
+        import os
+        os.makedirs(output_path, exist_ok=True)
+        with open(os.path.join(output_path, "config.json"), "w") as f:
+            json.dump(self.get_config_dict(), f, indent=2)
+
 
 class WordSenseTransformer(SentenceTransformer):
     """
@@ -327,14 +334,25 @@ def show_polysemy_examples(polysemous: dict, n_words: int = 5):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Train word-sense embeddings on WordNet")
+    parser.add_argument("--model", type=str, default="distilbert-base-uncased",
+                        help="Base model to train")
+    parser.add_argument("--epochs", type=int, default=1, help="Number of training epochs")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate")
+    args = parser.parse_args()
+
     # Configuration
-    model_name = "distilbert-base-uncased"
-    num_train_epochs = 3
-    batch_size = 64
-    learning_rate = 2e-5
+    model_name = args.model
+    num_train_epochs = args.epochs
+    batch_size = args.batch_size
+    learning_rate = args.lr
     warmup_ratio = 0.1
 
-    output_dir = f"output/wordnet-wordsense-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    # Create output directory with model name
+    model_short_name = model_name.split("/")[-1]
+    output_dir = f"output/wordnet-{model_short_name}-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
 
     # Load data with inter-word negatives
     train_dataset, val_anchors, val_positives, test_anchors, test_positives, polysemous = \
@@ -429,6 +447,7 @@ def main():
     # Evaluate before training
     logging.info("\n📊 Evaluating model before training...")
     evaluator(model, epoch=0, steps=0)
+    baseline_wsd = evaluate_word_sense_disambiguation(model, polysemous, "baseline")
 
     # Train
     logging.info("\n🚀 Starting training...")
@@ -453,9 +472,66 @@ def main():
     for metric, value in test_results.items():
         logging.info(f"  {metric}: {value:.4f}")
 
+    # WSD evaluation after training
+    trained_wsd = evaluate_word_sense_disambiguation(model, polysemous, "trained")
+
+    # Compare
+    improvement = trained_wsd["wsd_accuracy"] - baseline_wsd["wsd_accuracy"]
+    logging.info(f"\n📈 WSD Improvement: {baseline_wsd['wsd_accuracy']:.1%} → {trained_wsd['wsd_accuracy']:.1%} ({improvement:+.1%})")
+
     # Show disambiguation examples
     logging.info("\n🎯 Word Sense Disambiguation Examples:")
     show_disambiguation_examples(model, polysemous)
+
+
+def evaluate_word_sense_disambiguation(model: WordSenseTransformer, polysemous: dict, split_name: str = "validation"):
+    """
+    Evaluate word sense disambiguation accuracy.
+
+    For each polysemous word, check if the model correctly matches each example
+    to its definition among all definitions of that word.
+
+    Returns accuracy metrics.
+    """
+    correct = 0
+    total = 0
+    correct_by_num_senses = defaultdict(lambda: [0, 0])  # [correct, total]
+
+    for word, examples in polysemous.items():
+        if len(examples) < 2:
+            continue
+
+        n_senses = len(examples)
+
+        # Encode all examples and definitions for this word
+        anchors = [f"'{word}': {ex['example']}" for ex in examples]
+        definitions = [f"'{word}': {ex['definition']}" for ex in examples]
+
+        anchor_embs = model.encode(anchors, convert_to_tensor=True, normalize_embeddings=True)
+        def_embs = model.encode(definitions, convert_to_tensor=True, normalize_embeddings=True)
+
+        # Compute similarity matrix
+        sims = torch.mm(anchor_embs, def_embs.T)
+
+        # Check if each example retrieves its correct definition
+        for i in range(len(examples)):
+            top_idx = sims[i].argmax().item()
+            if top_idx == i:
+                correct += 1
+                correct_by_num_senses[n_senses][0] += 1
+            total += 1
+            correct_by_num_senses[n_senses][1] += 1
+
+    accuracy = correct / total if total > 0 else 0
+
+    logging.info(f"\n📊 Word Sense Disambiguation Evaluation ({split_name}):")
+    logging.info(f"  Overall Accuracy: {accuracy:.1%} ({correct}/{total})")
+    logging.info(f"  Breakdown by number of senses:")
+    for n_senses in sorted(correct_by_num_senses.keys())[:10]:
+        c, t = correct_by_num_senses[n_senses]
+        logging.info(f"    {n_senses} senses: {c/t:.1%} ({c}/{t})")
+
+    return {"wsd_accuracy": accuracy, "wsd_correct": correct, "wsd_total": total}
 
 
 def show_disambiguation_examples(model: WordSenseTransformer, polysemous: dict, n_words: int = 5):

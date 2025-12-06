@@ -1,4 +1,4 @@
-# Distribution / packaging
+output
 .Python
 build/
 develop-eggs/
